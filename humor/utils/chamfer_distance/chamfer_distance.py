@@ -5,9 +5,17 @@
 import torch
 from torch.utils.cpp_extension import load
 import os
+
 FileDirPath = os.path.dirname(os.path.realpath(__file__))
-#print('[ INFO ]: Chamfer directory:', FileDirPath)
-cd = load(name='cd', sources=[os.path.join(FileDirPath, 'chamfer_distance.cpp'), os.path.join(FileDirPath, 'chamfer_distance.cu')])
+# print('[ INFO ]: Chamfer directory:', FileDirPath)
+cd = load(
+    name="cd",
+    sources=[
+        os.path.join(FileDirPath, "chamfer_distance.cpp"),
+        os.path.join(FileDirPath, "chamfer_distance.cu"),
+    ],
+)
+
 
 class ChamferDistanceFunction(torch.autograd.Function):
     @staticmethod
@@ -46,11 +54,15 @@ class ChamferDistanceFunction(torch.autograd.Function):
         gradxyz2 = torch.zeros(xyz2.size())
 
         if not graddist1.is_cuda:
-            cd.backward(xyz1, xyz2, gradxyz1, gradxyz2, graddist1, graddist2, idx1, idx2)
+            cd.backward(
+                xyz1, xyz2, gradxyz1, gradxyz2, graddist1, graddist2, idx1, idx2
+            )
         else:
             gradxyz1 = gradxyz1.cuda()
             gradxyz2 = gradxyz2.cuda()
-            cd.backward_cuda(xyz1, xyz2, gradxyz1, gradxyz2, graddist1, graddist2, idx1, idx2)
+            cd.backward_cuda(
+                xyz1, xyz2, gradxyz1, gradxyz2, graddist1, graddist2, idx1, idx2
+            )
 
         return gradxyz1, gradxyz2
 
