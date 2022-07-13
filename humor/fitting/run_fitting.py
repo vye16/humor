@@ -6,13 +6,14 @@ and stage 3 is the main optimization that uses HuMoR.
 '''
 
 
-import sys, os
+import sys, os, glob
 cur_file_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(cur_file_path, '..'))
 
 import importlib, time, math, shutil, json
 import traceback
 
+import cv2
 import numpy as np
 
 import torch
@@ -28,16 +29,20 @@ from datasets.rgb_dataset import RGBVideoDataset
 from utils.torch import load_state
 from utils.logging import mkdir
 from fitting.config import parse_args
-from fitting.fitting_utils import NSTAGES, DEFAULT_FOCAL_LEN, load_vposer, save_optim_result, save_rgb_stitched_result
+from fitting.fitting_utils import NSTAGES, load_vposer, save_optim_result, save_rgb_stitched_result
 from fitting.motion_optimizer import MotionOptimizer
 from utils.video import video_to_images, run_openpose, run_deeplab_v3
 
 from body_model.body_model import BodyModel
 from body_model.utils import SMPLX_PATH, SMPLH_PATH
 
-def main(args, config_file):
+def main(args, config_file, extra_args={}):
     res_out_path = None
     if args.out is not None:
+        if args.video_seq != "" and args.track_id is not None:
+            args.out = os.path.join(args.out, args.video_seq, args.track_id)
+        print("SAVING TO", args.out)
+
         mkdir(args.out)
         # create logging system
         fit_log_path = os.path.join(args.out, 'fit_' + str(int(time.time())) + '.log')
@@ -50,6 +55,11 @@ def main(args, config_file):
     Logger.log('args: ' + str(args))
     # and save config
     cp_files(args.out, [config_file])
+    if len(extra_args) > 0:
+        print("writing extra args to file", extra_args)
+        with open(os.path.join(args.out, os.path.basename(config_file)), "a") as f:
+            for k, v in extra_args.items():
+                f.write(f"--{k} {v}\n")
     
     device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -101,6 +111,7 @@ def main(args, config_file):
                             )
         data_fps = 30
         im_dim = (1920, 1080)
+
     elif args.data_type == 'iMapper-RGB':
         dataset = iMapperDataset(args.data_path,
                                 seq_len=args.imapper_seq_len,
@@ -112,71 +123,84 @@ def main(args, config_file):
                             )
         data_fps = 30
         im_dim = (1920, 1080)
+
     elif args.data_type == 'RGB':
         # preprocess video to info needed for optim
         video_preprocess_path = os.path.join(args.out, 'rgb_preprocess')
-        img_folder = os.path.join(video_preprocess_path, 'raw_frames')
         mask_out_path = None
-        if args.mask_joints2d:
-            mask_out_path = os.path.join(video_preprocess_path, 'masks')
-        op_out_path = os.path.join(video_preprocess_path, 'op_keypoints')
+        if not args.data_is_dir:
+            img_folder = os.path.join(video_preprocess_path, 'raw_frames')
 
-        use_custom_keypts = args.op_keypts is not None
+            # get frames
+            if not os.path.exists(img_folder):
+                if os.path.splitext(args.data_path)[-1] != ".mp4":
+                    print(f"{args.data_path} does not have mp4 extension")
+                    exit()
 
-        # if we already did preprocessing (ran same video before), skip it
-        if not os.path.exists(video_preprocess_path) or (not use_custom_keypts and not os.path.exists(op_out_path)):
-            mkdir(video_preprocess_path)
-            # video -> images (at 30 Hz) - save to new output directory
-            img_folder, _, img_shape = video_to_images(args.data_path,
-                                                            fps=30,
-                                                            img_folder=img_folder,
-                                                            return_info=True)
-            print(img_folder)
-            print(img_shape)
+                # video -> images (at 30 Hz) - save to new output directory
+                os.makedirs(video_preprocess_path, exist_ok=True)
+                img_folder = video_to_images(args.data_path, fps=30, img_folder=img_folder)
+                print(f"{args.data_path} frames extracted to {img_folder}")
 
-            if not use_custom_keypts:
-                # OpenPose on images
-                op_frames_out = os.path.join(video_preprocess_path, 'op_frames')
-                run_openpose(args.openpose, img_folder,
-                            op_out_path,
-                            img_out=op_frames_out,
-                            video_out=os.path.join(video_preprocess_path, 'op_keypoints_overlay.mp4'))
+            camera_path = None
+        
+        else:  # assume a pre-processed directory with images, masks, keypoints, and cameras
 
-            # if desired segmentation mask on images
+            img_folder = os.path.join(args.data_path, "images", args.video_seq)
+            camera_path = os.path.join(args.data_path, "cameras", args.video_seq, "cameras.npz")
+            print(img_folder, camera_path)
+            if args.op_keypts is not None:
+                assert args.track_id is not None
+                args.op_keypts = os.path.join(args.data_path, args.op_keypts, args.video_seq, args.track_id)
+                assert os.path.isdir(args.op_keypts)
             if args.mask_joints2d:
-                run_deeplab_v3(img_folder, img_shape[:2],
-                            mask_out_path,
-                            batch_size=4)
-        else:
-            print('Already pre-processed video, skipping pre-processing...')
-            import cv2
-            img_shape = cv2.imread(os.path.join(img_folder, '000001.png')).shape
-            if args.mask_joints2d and not os.path.exists(mask_out_path):
-                print('Could not find detected masks from previous pre-processing! Please delete rgb_preprocess directory and re-run!')
-                exit()
+                assert args.track_id is not None
+                mask_out_path = os.path.join(args.data_path, args.mask_dir, args.video_seq, args.track_id)
+                assert os.path.isdir(mask_out_path)
+
+            assert os.path.isdir(img_folder)
+            assert os.path.isfile(camera_path)
+
+        img_files = sorted(glob.glob(f"{img_folder}/*"))
+        img_shape = cv2.imread(img_files[0]).shape
+
+        # check keypoints
+        use_custom_keypts = args.op_keypts is not None
+        op_out_path = os.path.join(video_preprocess_path, 'op_keypoints')
+        if not use_custom_keypts and not os.path.exists(op_out_path):
+            # run OpenPose on images
+            op_frames_out = os.path.join(video_preprocess_path, 'op_frames')
+            os.makedirs(op_frames_out, exist_ok=True)
+            run_openpose(args.openpose, img_folder,
+                        op_out_path,
+                        img_out=op_frames_out,
+                        video_out=os.path.join(video_preprocess_path, 'op_keypoints_overlay.mp4'))
 
         if use_custom_keypts:
             assert os.path.exists(args.op_keypts), 'Could not find custom keypoints path %s!' % (args.op_keypts)
             print('Using pre-detected OpenPose keypoints from %s...' % (args.op_keypts))
             op_out_path = args.op_keypts
 
-        # read in intrinsics if given
-        cam_mat = None
-        if args.rgb_intrinsics is None:
-            cam_mat = np.array([[DEFAULT_FOCAL_LEN[0], 0.0, img_shape[1] / 2.],
-                                [0.0, DEFAULT_FOCAL_LEN[1], img_shape[0] / 2.],
-                                [0.0, 0.0, 1.0]])
-        else:
-            with open(args.rgb_intrinsics, 'r') as f:
-                intrins_data = json.load(f)
-            cam_mat = np.array(intrins_data)
-        
+        # if desired segmentation mask on images
+        if args.mask_joints2d and mask_out_path is None:
+            mask_out_path = os.path.join(video_preprocess_path, 'masks')
+        print("Mask output directory", mask_out_path)
+
+        if args.mask_joints2d and not os.path.exists(mask_out_path):
+            os.makedirs(mask_out_path, exist_ok=True)
+            run_deeplab_v3(img_folder, img_shape[:2],
+                        mask_out_path,
+                        batch_size=4)
+
+
         # Create dataset by splitting the video up into overlapping clips
         vid_name = '.'.join(args.data_path.split('/')[-1].split('.')[:-1])
         dataset = RGBVideoDataset(op_out_path,
-                                  cam_mat,
+                                  camera_path,
                                   seq_len=args.rgb_seq_len,
                                   overlap_len=args.rgb_overlap_len,
+                                  start_idx=args.start_idx,
+                                  end_idx=args.end_idx,
                                   img_path=img_folder,
                                   load_img=False,
                                   masks_path=mask_out_path,
@@ -370,6 +394,9 @@ def main(args, config_file):
         if 'cam_matx' in gt_data:
             cam_mat = gt_data['cam_matx'].to(device)
 
+        optim_scale = 'cam_R' in observed_data and 'cam_t' in observed_data
+        print("OPTIMIZING SCALE?", optim_scale)
+
         #  save meta results information about the optimized bm and GT bm (gender)
         if args.save_results:
             for bidx, cur_res_out_path in enumerate(cur_res_out_paths):
@@ -390,13 +417,14 @@ def main(args, config_file):
                                     [k for k in observed_data.keys()],
                                     all_stage_loss_weights,
                                     pose_prior,
-                                    motion_prior,
-                                    init_motion_prior,
-                                    use_joints2d,
-                                    cam_mat,
-                                    args.robust_loss,
-                                    args.robust_tuning_const,
-                                    args.joint2d_sigma,
+                                    motion_prior=motion_prior,
+                                    init_motion_prior=init_motion_prior,
+                                    optim_floor=use_joints2d,
+                                    optim_scale=optim_scale,
+                                    camera_matrix=cam_mat,
+                                    robust_loss_type=args.robust_loss,
+                                    robust_tuning_const=args.robust_tuning_const,
+                                    joint2d_sigma=args.joint2d_sigma,
                                     stage3_tune_init_state=args.stage3_tune_init_state,
                                     stage3_tune_init_num_frames=args.stage3_tune_init_num_frames,
                                     stage3_tune_init_freeze_start=args.stage3_tune_init_freeze_start,
@@ -454,6 +482,18 @@ def main(args, config_file):
 
 
 if __name__=='__main__':
-    args = parse_args(sys.argv[1:])
-    config_file = sys.argv[1:][0][1:]
-    main(args, config_file)
+    argv = sys.argv[1:]
+    arg_str, config_file = " ".join(argv).split('@')[:2]
+    print(arg_str)
+    # parse extra args
+    tokens = [x.split() for x in arg_str.split("--")]
+    extra_args = {x[0].replace("-", "_"): (x[1:] if len(x) > 2 else x[1]) for x in tokens if len(x) > 1}
+    print(extra_args)
+
+    args = parse_args(argv)
+    for k, v in extra_args.items():
+        setattr(args, k, v)
+    print(args)
+
+    print(config_file)
+    main(args, config_file, extra_args)

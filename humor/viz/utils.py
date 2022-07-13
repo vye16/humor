@@ -45,8 +45,9 @@ def create_video(img_path, out_path, fps):
     '''
     Creates a video from the frame format in the given directory and saves to out_path.
     '''
-    command = ['ffmpeg', '-y', '-r', str(fps), '-i', img_path, \
-                    '-vcodec', 'libx264', '-crf', '25', '-pix_fmt', 'yuv420p', out_path]
+    command = ['ffmpeg', '-r', str(fps), '-i', img_path,
+                '-vcodec', 'libx264', '-crf', '25', '-pix_fmt', 'yuv420p',
+                '-y', '-loglevel', 'error', out_path]
     subprocess.run(command)
 
 def create_gif(img_path, out_path, fps):
@@ -55,7 +56,7 @@ def create_gif(img_path, out_path, fps):
     '''
     vid_path = out_path[:-3] + 'mp4'
     create_video(img_path, vid_path, fps)
-    subprocess.run(['ffmpeg', '-y', '-i', vid_path, \
+    subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', vid_path,
                     '-pix_fmt', 'rgb8', out_path])
 
 def create_comparison_images(img1_dir, img2_dir, out_dir, text1=None, text2=None):
@@ -75,11 +76,11 @@ def create_comparison_images(img1_dir, img2_dir, out_dir, text1=None, text2=None
 
         if text1 is not None:
             d = ImageDraw.Draw(img1)
-            font = ImageFont.truetype('Pillow/Tests/fonts/FreeMono.ttf', 12)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 12)
             d.text((10, 10), text1, fill=(0,0,0), font=font)
         if text2 is not None:
             d = ImageDraw.Draw(img2)
-            font = ImageFont.truetype('Pillow/Tests/fonts/FreeMono.ttf', 12)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 12)
             d.text((10, 10), text2, fill=(0,0,0), font=font)
 
         dst = Image.new('RGB', (img1.width + img2.width, img1.height))
@@ -109,7 +110,7 @@ def create_multi_comparison_images(img_dirs, out_dir, texts=None, extn='.png'):
             cur_img = Image.open(cur_img_path)
             if use_text:
                 d = ImageDraw.Draw(cur_img)
-                font = ImageFont.truetype('Pillow/Tests/fonts/FreeMono.ttf', 12)
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 12)
                 d.text((10, 10), texts[im_idx], fill=(0,0,0), font=font)
             img_list.append(cur_img)
             width_list.append(cur_img.width)
@@ -137,7 +138,10 @@ def viz_smpl_seq(body, imw=1080, imh=1080, fps=30, contacts=None,
                 contact_color=[1.0, 0.0, 0.0],
                 render_bodies_static=None,
                 render_points_static=None,
-                cam_rot=None):
+                cam_rot=None,
+                cam_R=None,
+                cam_t=None,
+                ):
     '''
     Visualizes the body model output of a smpl sequence.
     - body : body model output from SMPL forward pass (where the sequence is the batch)
@@ -159,7 +163,15 @@ def viz_smpl_seq(body, imw=1080, imh=1080, fps=30, contacts=None,
             vtx_alpha = np.ones((vertex_colors.shape[0], 1))*body_alpha
             vertex_colors = np.concatenate([vertex_colors, vtx_alpha], axis=1)
         faces = c2c(body.f)
-        body_mesh_seq = [trimesh.Trimesh(vertices=c2c(body.v[i]), faces=faces, vertex_colors=vertex_colors, process=False) for i in range(body.v.size(0))]
+        verts = body.v
+
+        if cam_R is not None and cam_t is not None:
+            # cam_R (T, 3, 3) cam_t (T, 3)
+            # body.v (T, n_verts, 3)
+            verts = torch.matmul(cam_R[:, None], verts[..., None])[..., 0]
+            verts = verts + cam_t[:, None]
+
+        body_mesh_seq = [trimesh.Trimesh(vertices=c2c(verts[i]), faces=faces, vertex_colors=vertex_colors, process=False) for i in range(verts.size(0))]
 
     if render_joints and joints_seq is None:
         start_t = time.time()

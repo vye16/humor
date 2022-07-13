@@ -4,3 +4,5 @@ body_models
 data
 checkpoints
 out
+log*/
+*.swp

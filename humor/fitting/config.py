@@ -6,13 +6,20 @@ def parse_args(argv):
     parser = SplitLineParser(fromfile_prefix_chars='@', allow_abbrev=False)
 
     # Observed data options
-    parser.add_argument('--data-path', type=str, required=True, help='Path to the data to fit.')
     parser.add_argument('--data-type', type=str, required=True, choices=['AMASS', 'PROX-RGB', 'PROX-RGBD', 'iMapper-RGB', 'RGB'], help='The type of data we are fitting to.')
+    parser.add_argument('--data-path', type=str, required=True, help='Path to the data to fit.')
+    parser.add_argument("--data-is-dir", action="store_true", help="Data path is a directory, otherwise just a video")
+    parser.add_argument("--video-seq", type=str, default="", help="sequence name of data, if applicable [default '']")
+    parser.add_argument("--track-id", type=str, default=None, help="sequence name of data, if applicable [default '']")
+    parser.add_argument("-s", "--start-idx", type=int, default=0, help="start index of data points [default 0]")
+    parser.add_argument("-e", "--end-idx", type=int, default=-1, help="end index of data points [default -1]")
+    parser.add_argument('--op-keypts', type=str, default=None, help='(optional) path to a directory of custom detected OpenPose keypoints to use for RGB fitting rather than running OpenPose before optimization.')
+    parser.add_argument('--mask-dir', type=str, default=None, help='(optional) path to a directory of custom detected masks to use for RGB fitting.')
+
     parser.add_argument('--data-fps', type=int, default=30, help='Sampling rate of the data.')
     parser.add_argument('--batch-size', type=int, default=1, help='Number of sequences to batch together for fitting to data.')
     parser.add_argument('--shuffle', dest='shuffle', action='store_true', help="Shuffles data.")
     parser.set_defaults(shuffle=False)
-    parser.add_argument('--op-keypts', type=str, default=None, help='(optional) path to a directory of custom detected OpenPose keypoints to use for RGB fitting rather than running OpenPose before optimization.')
 
     # AMASS-specific options
     parser.add_argument('--amass-split-by', type=str, default='dataset', choices=['single', 'sequence', 'subject', 'dataset'], help='How to split the dataset into train/test/val.')
@@ -49,6 +56,7 @@ def parse_args(argv):
     parser.add_argument('--rgb-seq-len', type=int, default=None, help='If none, fits the whole video at once. If given, is the max number of frames to use when splitting the video into subseqeunces for fitting.')
     parser.add_argument('--rgb-overlap-len', type=int, default=None, help='If None, fitst the whole video at once. If given, is the minimum number of frames to overlap subsequences extracted from the given video. These overlapped frames are used in a consistency energy.')
     parser.add_argument('--rgb-intrinsics', type=str, default=None, help='Path to the camera intrinsics file to use for re-projection energy. If not given uses defaults.')
+    parser.add_argument("--camera-path", type=str, default=None, help="Path to camera poses")
     parser.add_argument('--rgb-planercnn-res', type=str, default=None, help='Path to results of PlaneRCNN detection. If given uses this to initialize the floor plane otherwise uses defaults.')
     parser.add_argument('--rgb-overlap-consist-weight', type=float,nargs=NSTAGES, default=[0.0, 0.0, 0.0], help='Enforces consistency between overlapping subsequences within a batch in terms of the ground plane, shape params, and joint positions.')
 

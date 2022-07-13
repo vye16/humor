@@ -38,13 +38,16 @@ class FittingLoss(nn.Module):
         self.loss_weights = self.all_stage_loss_weights[self.cur_stage_idx]
         self.smpl2op_map = smpl2op_map
         self.ignore_op_joints = ignore_op_joints
+
         self.cam_f = cam_f
         self.cam_cent = cam_cent
+
         self.joints2d_sigma = joints2d_sigma
 
         self.can_reproj = self.smpl2op_map is not None and \
                           self.cam_f is not None and \
                           self.cam_cent is not None
+
         if self.can_reproj:
             self.cam_f = self.cam_f.reshape((-1, 1, 2))
             self.cam_cent = self.cam_cent.reshape((-1, 1, 2))
@@ -125,9 +128,13 @@ class FittingLoss(nn.Module):
             if not self.can_reproj:
                 Logger.log('Must provide camera intrinsics and SMPL to OpenPose joint map to use re-projection loss!')
                 exit()
+            
             cur_loss = self.joints2d_loss(observed_data['joints2d'],
                                           pred_data['joints3d'],
                                           pred_data['joints3d_extra'],
+                                          pred_data['world_scale'],
+                                          cam_R=observed_data.get('cam_R', None),
+                                          cam_t=observed_data.get('cam_t', None),
                                           debug_img=None)
             loss += self.loss_weights['joints2d']*cur_loss
             stats_dict['joints2d'] = cur_loss
@@ -314,12 +321,14 @@ class FittingLoss(nn.Module):
         '''
         return torch.logical_not(torch.isinf(obs_data))
 
-    def joints2d_loss(self, joints2d_obs, joints3d_pred, joints3d_extra_pred, cam_t=None, cam_R=None, debug_img=None):
+    def joints2d_loss(self, joints2d_obs, joints3d_pred, joints3d_extra_pred, world_scale, cam_R=None, cam_t=None, debug_img=False):
         '''
-        Cam extrinsics are assumed the same for entire sequence
-        - cam_t : (B, 3)
-        - cam_R : (B, 3, 3)
+        :param world_scale (B, 1)
+        :param cam_R (B, T, 3, 3)
+        :param cam_t (B, T, 3)
         '''
+        # B is batch size, T is sequence length for a set of sequences
+
         B, T, _, _ = joints2d_obs.size()
         # need extra joints that correspond to openpose
         joints3d_full = torch.cat([joints3d_pred, joints3d_extra_pred], dim=2)
@@ -327,14 +336,20 @@ class FittingLoss(nn.Module):
         joints3d_op = joints3d_op.reshape((B*T, OP_NUM_JOINTS, 3))
 
         # either use identity cam params or expand the ones given to full sequence
+        if cam_R is None:
+            cam_R = torch.eye(3).reshape((1, 3, 3)).expand((B*T, 3, 3))
+        else:
+            cam_R = cam_R[:B, :T].reshape(B*T, 3, 3)
+        cam_R = cam_R.to(joints3d_pred)
+
         if cam_t is None:
             cam_t = torch.zeros((B*T, 3)).to(joints3d_pred)
         else:
-            cam_t = cam_t.unsqueeze(1).expand((B, T, 3)).reshape((B*T, 3))
-        if cam_R is None:
-            cam_R = torch.eye(3).reshape((1, 3, 3)).expand((B*T, 3, 3)).to(joints3d_pred)
-        else:
-            cam_R = cam_R.unsqueeze(1).expand((B, T, 3, 3)).reshape((B*T, 3, 3))
+            cam_t = cam_t[:B, :T].reshape(B*T, 3)
+        cam_t = cam_t.to(joints3d_pred)
+
+        # apply the world scale
+        cam_t = cam_t * world_scale.expand(-1, T).reshape(B*T, 1)
 
         # project points to 2D
         cam_f = self.cam_f.expand((B, T, 2)).reshape((B*T, 2))

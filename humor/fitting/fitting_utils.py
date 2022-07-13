@@ -280,12 +280,16 @@ def save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_dat
     res_trans = optim_result['trans'].cpu().numpy()
     res_root_orient = optim_result['root_orient'].cpu().numpy()
     res_body_pose = optim_result['pose_body'].cpu().numpy()
+    res_world_scale = None
     res_contacts = None
     res_floor_plane = None
     if 'contacts' in optim_result:
         res_contacts = optim_result['contacts'].cpu().numpy()
     if 'floor_plane' in optim_result:
         res_floor_plane = optim_result['floor_plane'].cpu().numpy()
+    if 'world_scale' in optim_result:
+        res_world_scale = optim_result['world_scale'].cpu().numpy()
+
     for bidx, cur_res_out_path in enumerate(cur_res_out_paths):
         cur_res_out_path = os.path.join(cur_res_out_path, 'stage3_results.npz')
         save_dict = { 
@@ -298,6 +302,9 @@ def save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_dat
             save_dict['contacts'] = res_contacts[bidx]
         if res_floor_plane is not None:
             save_dict['floor_plane'] = res_floor_plane[bidx]
+        if res_world_scale is not None:
+            save_dict['world_scale'] = res_world_scale[bidx]
+
         np.savez(cur_res_out_path, **save_dict)
 
     # in prior coordinate frame
@@ -314,6 +321,8 @@ def save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_dat
             }
             if res_contacts is not None:
                 save_dict['contacts'] = res_contacts[bidx]
+            if res_world_scale is not None:
+                save_dict['world_scale'] = res_world_scale[bidx]
             np.savez(cur_res_out_path, **save_dict)
 
     # ground truth
@@ -321,6 +330,7 @@ def save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_dat
                 'trans' in gt_data and \
                 'root_orient' in gt_data and \
                 'pose_body' in gt_data
+
     if save_gt:
         gt_betas = gt_data['betas'].cpu().numpy()
         if data_type not in ['PROX-RGB', 'PROX-RGBD']:
@@ -375,10 +385,11 @@ def save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_dat
     elif 'cam_matx' in gt_data:
         # need the intrinsics even if we have nothing else
         cam_mat = gt_data['cam_matx'].cpu().numpy()
+
         for bidx, cur_res_out_path in enumerate(cur_res_out_paths):
             cur_res_out_path = os.path.join(cur_res_out_path, 'gt_results.npz')
             save_dict = { 
-                'cam_mtx' : cam_mat[bidx]
+                'cam_mtx' : cam_mat[bidx],
             }
             np.savez(cur_res_out_path, **save_dict)
 
@@ -392,7 +403,8 @@ def save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_dat
             # print(cur_obs_out['img_paths'])
         if obs_mask_paths is not None:
             cur_obs_out['mask_paths'] = [frame_tup[bidx] for frame_tup in obs_mask_paths]
-        np.savez(obs_out_path, **cur_obs_out)    
+        print("Saving observations", cur_obs_out.keys())
+        np.savez(obs_out_path, **cur_obs_out)
 
 
 def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, device,
@@ -406,7 +418,7 @@ def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, dev
 
     # if arbitray RGB video data, stitch together to save full sequence output
     all_res_dirs = all_res_out_paths
-    print(all_res_dirs)
+    print("all res_dirs", all_res_dirs)
 
     final_res_out_path = os.path.join(res_out_path, 'final_results')
     mkdir(final_res_out_path)
@@ -425,7 +437,7 @@ def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, dev
             concat_ground_planes = torch.Tensor(cur_stage3_res['floor_plane']).to(device).reshape((1, -1))
         else:
             concat_ground_planes = torch.cat([concat_ground_planes, torch.Tensor(cur_stage3_res['floor_plane']).to(device).reshape((1, -1))], dim=0)
-        cur_stage3_res = {k : v for k, v in cur_stage3_res.items() if k in ['betas', 'trans', 'root_orient', 'pose_body']}
+        cur_stage3_res = {k : v for k, v in cur_stage3_res.items() if k in ['betas', 'trans', 'root_orient', 'pose_body', 'world_scale']}
         cur_stage3_res = prep_res(cur_stage3_res, device, cur_stage3_res['trans'].shape[0])
         if concat_cam_res is None: 
             concat_cam_res = cur_stage3_res
@@ -471,12 +483,14 @@ def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, dev
     res_trans = concat_cam_res['trans'].clone().detach().cpu().numpy()
     res_root_orient = concat_cam_res['root_orient'].clone().detach().cpu().numpy()
     res_body_pose = concat_cam_res['pose_body'].clone().detach().cpu().numpy()
+    res_world_scale = concat_cam_res['world_scale'].clone().detach().cpu().numpy()
     res_floor_plane = concat_ground_planes[0].clone().detach().cpu().numpy() # NOTE: saves estimate from first subsequence
     res_contacts = concat_contacts.clone().detach().cpu().numpy()
     np.savez(concat_res_out_path, betas=res_betas,
                                 trans=res_trans,
                                 root_orient=res_root_orient,
                                 pose_body=res_body_pose,
+                                world_scale=res_world_scale,
                                 floor_plane=res_floor_plane,
                                 contacts=res_contacts)
 
@@ -496,7 +510,7 @@ def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, dev
                                                                         concat_cam_res['root_orient'][0].unsqueeze(0),
                                                                         viz_joints3d[0].unsqueeze(0))
     # transform the whole sequence
-    input_data_dict = {kb : vb.unsqueeze(0) for kb, vb in concat_cam_res.items() if kb in ['trans', 'root_orient', 'pose_body', 'betas']}
+    input_data_dict = {kb : vb.unsqueeze(0) for kb, vb in concat_cam_res.items() if kb in ['trans', 'root_orient', 'pose_body', 'betas', 'world_scale']}
     viz_prior_data_dict = apply_cam2prior(input_data_dict, cam2prior_R, cam2prior_t, cam2prior_root_height, 
                                             input_data_dict['pose_body'],
                                             input_data_dict['betas'],
@@ -506,7 +520,8 @@ def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, dev
         'trans' : viz_prior_data_dict['trans'][0],
         'root_orient' : viz_prior_data_dict['root_orient'][0],
         'pose_body' : concat_cam_res['pose_body'],
-        'betas' : concat_cam_res['betas']
+        'betas' : concat_cam_res['betas'],
+        'world_scale': concat_cam_res['world_scale'],
     }
 
     # save pose prior frame
@@ -515,12 +530,15 @@ def save_rgb_stitched_result(seq_intervals, all_res_out_paths, res_out_path, dev
     res_trans = concat_prior_res['trans'].clone().detach().cpu().numpy()
     res_root_orient = concat_prior_res['root_orient'].clone().detach().cpu().numpy()
     res_body_pose = concat_prior_res['pose_body'].clone().detach().cpu().numpy()
+    res_world_scale = concat_prior_res['world_scale'].clone().detach().cpu().numpy()
     res_contacts = concat_contacts.clone().detach().cpu().numpy()
     np.savez(concat_prior_res_out_path, betas=res_betas,
                                 trans=res_trans,
                                 root_orient=res_root_orient,
                                 pose_body=res_body_pose,
-                                contacts=res_contacts)
+                                contacts=res_contacts,
+                                world_scale=res_world_scale,
+    )
 
 
 def load_res(result_dir, file_name):
@@ -557,11 +575,15 @@ def prep_res(np_res, device, T):
         'betas' : betas,
         'trans' : trans,
         'root_orient' : root_orient,
-        'pose_body' : pose_body
+        'pose_body' : pose_body,
     }
 
+    if 'world_scale' in np_res:
+        world_scale = np_res['world_scale']
+        res_dict['world_scale'] = torch.Tensor(world_scale).to(device)
+
     for k, v in np_res.items():
-        if k not in ['betas', 'trans', 'root_orient', 'pose_body']:
+        if k not in ['betas', 'trans', 'root_orient', 'pose_body', 'world_scale']:
             res_dict[k] = v
     return res_dict
 

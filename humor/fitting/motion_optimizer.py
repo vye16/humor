@@ -40,6 +40,7 @@ class MotionOptimizer():
                        motion_prior=None, # humor model
                        init_motion_prior=None, # dict of GMM params to use for prior on initial motion state
                        optim_floor=False, # if true, optimize the floor plane along with body motion (need 2d observations)
+                       optim_scale=False,
                        camera_matrix=None, # camera intrinsics to use for reprojection if applicable
                        robust_loss_type='none',
                        robust_tuning_const=4.6851,
@@ -71,17 +72,24 @@ class MotionOptimizer():
 
         # number of states to explicitly optimize for
         # For first stages this will always be the full sequence
+
         num_state_steps = T
+
         # latent body pose
         self.pose_prior = pose_prior
         self.latent_pose_dim = self.pose_prior.latentD
         self.latent_pose = torch.zeros((B, num_state_steps, self.latent_pose_dim)).to(device)
+
         # root (global) transformation
         self.trans = torch.zeros((B, num_state_steps, 3)).to(device)
         self.root_orient = torch.zeros((B, num_state_steps, 3)).to(device) # aa parameterization
         self.root_orient[:,:,0] = np.pi
+
         # body shape
         self.betas = torch.zeros((B, num_betas)).to(device) # same shape for all steps
+
+        # world scale
+        self.world_scale = torch.ones((B, 1)).to(device)
 
         self.motion_prior = motion_prior
         self.init_motion_prior = init_motion_prior
@@ -101,6 +109,17 @@ class MotionOptimizer():
         self.init_fidx = np.zeros((B)) # the frame chosen to use for the initial state (first frame by default)
 
         self.cam_f = self.cam_center = None
+        if camera_matrix is not None:
+            cam_fx = camera_matrix[:, 0, 0]
+            cam_fy = camera_matrix[:, 1, 1]
+            cam_cx = camera_matrix[:, 0, 2]
+            cam_cy = camera_matrix[:, 1, 2]
+            # focal length and center are same for all timesteps
+            self.cam_f = torch.stack([cam_fx, cam_fy], dim=1)
+            self.cam_center = torch.stack([cam_cx, cam_cy], dim=1)
+
+        self.optim_scale = optim_scale
+
         if self.optim_floor:
             if camera_matrix is None:
                 Logger.log('Must have camera intrinsics (camera_matrix) to optimize the floor plane!')
@@ -113,15 +132,6 @@ class MotionOptimizer():
             self.cam2prior_R = torch.eye(3).reshape((1, 3, 3)).expand((B, 3, 3)).to(device)
             self.cam2prior_t = torch.zeros((B, 3)).to(device)
             self.cam2prior_root_height = torch.zeros((B, 1)).to(device)
-
-            cam_fx = camera_matrix[:, 0, 0]
-            cam_fy = camera_matrix[:, 1, 1]
-            cam_cx = camera_matrix[:, 0, 2]
-            cam_cy = camera_matrix[:, 1, 2]
-            # focal length and center are same for all timesteps
-            self.cam_f = torch.stack([cam_fx, cam_fy], dim=1)
-            self.cam_center = torch.stack([cam_cx, cam_cy], dim=1)
-        self.use_camera = self.cam_f is not None and self.cam_center is not None
 
         #
         # create the loss function
@@ -226,6 +236,7 @@ class MotionOptimizer():
         self.trans.requires_grad = True
         self.root_orient.requires_grad = True
         self.betas.requires_grad = False
+        self.world_scale.requires_grad = False
         self.latent_pose.requires_grad = False
 
         root_opt_params = [self.trans, self.root_orient]
@@ -245,6 +256,8 @@ class MotionOptimizer():
                 # Use current params to go through SMPL and get joints3d, verts3d, points3d
                 body_pose = self.latent2pose(self.latent_pose)
                 pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
+                pred_data['world_scale'] = self.world_scale
+
                 # compute data losses only
                 loss, stats_dict = self.fitting_loss.root_fit(observed_data, pred_data)
                 log_cur_stats(stats_dict, loss, iter=i)
@@ -262,12 +275,15 @@ class MotionOptimizer():
             res_trans = self.trans.clone().detach().cpu().numpy()
             res_root_orient = self.root_orient.clone().detach().cpu().numpy()
             res_body_pose = body_pose.clone().detach().cpu().numpy()
+            res_world_scale = self.world_scale.clone().detach().cpu().numpy()
             for bidx, res_out_path in enumerate(stages_res_out):
                 cur_res_out_path = os.path.join(res_out_path, 'stage1_results.npz')
                 np.savez(cur_res_out_path, betas=res_betas[bidx],
                                            trans=res_trans[bidx],
                                            root_orient=res_root_orient[bidx],
-                                           pose_body=res_body_pose[bidx])
+                                           pose_body=res_body_pose[bidx],
+                                           world_scale=res_world_scale[bidx],
+                )
 
         #
         # Stage II full pose and shape
@@ -280,6 +296,10 @@ class MotionOptimizer():
         self.latent_pose.requires_grad = True
 
         smpl_opt_params = [self.trans, self.root_orient, self.betas, self.latent_pose]
+
+        if self.optim_scale:
+            self.world_scale.requires_grad = True
+            smpl_opt_params += [self.world_scale]
 
         smpl_optim = torch.optim.LBFGS(smpl_opt_params,
                                     max_iter=lbfgs_max_iter,
@@ -297,6 +317,8 @@ class MotionOptimizer():
                 pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
                 pred_data['latent_pose'] = self.latent_pose
                 pred_data['betas'] = self.betas
+                pred_data['world_scale'] = self.world_scale
+
                 # compute data losses and pose prior
                 loss, stats_dict = self.fitting_loss.smpl_fit(observed_data, pred_data, self.seq_len)
                 log_cur_stats(stats_dict, loss, iter=i)
@@ -314,10 +336,12 @@ class MotionOptimizer():
             res_trans = self.trans.clone().detach().cpu().numpy()
             res_root_orient = self.root_orient.clone().detach().cpu().numpy()
             res_body_pose = body_pose.clone().detach().cpu().numpy()
+            res_world_scale = self.world_scale.clone().detach().cpu().numpy()
             for bidx, res_out_path in enumerate(stages_res_out):
                 cur_res_out_path = os.path.join(res_out_path, 'stage2_results.npz')
                 np.savez(cur_res_out_path, betas=res_betas[bidx],
                                         trans=res_trans[bidx],
+                                        world_scale=res_world_scale[bidx],
                                         root_orient=res_root_orient[bidx],
                                         pose_body=res_body_pose[bidx])
 
@@ -350,7 +374,8 @@ class MotionOptimizer():
                 'trans' : self.trans.clone().detach(),
                 'root_orient' : self.root_orient.clone().detach(),
                 'pose_body' : cur_body_pose.clone().detach(),
-                'betas' : self.betas.clone().detach()
+                'betas' : self.betas.clone().detach(),
+                'world_scale': self.world_scale.clone().detach(),
             }
 
         self.latent_motion = self.infer_latent_motion(self.trans, self.root_orient, cur_body_pose, self.betas, data_fps).detach()
@@ -393,15 +418,19 @@ class MotionOptimizer():
         self.trans.requires_grad = True
         self.root_orient.requires_grad = True
         self.latent_pose.requires_grad = True
-        if self.optim_floor:
-            self.floor_plane.requires_grad = True
         self.betas.requires_grad = True
 
         motion_opt_params = [self.trans, self.root_orient, self.latent_pose, self.betas]
         motion_opt_params += [self.latent_motion]
         motion_opt_params += prior_opt_params
+
         if self.optim_floor:
+            self.floor_plane.requires_grad = True
             motion_opt_params += [self.floor_plane]
+
+        if self.optim_scale:
+            self.world_scale.requires_grad = True
+            motion_opt_params += [self.world_scale]
 
         # record intiialization stats
         body_pose = self.latent2pose(self.latent_pose)
@@ -425,6 +454,7 @@ class MotionOptimizer():
             res_trans = cam_rollout_results['trans'].clone().detach().cpu().cpu().numpy()
             res_root_orient = cam_rollout_results['root_orient'].clone().detach().cpu().numpy()
             res_betas = self.betas.clone().detach().cpu().numpy()
+            res_world_scale = self.world_scale.clone().detach().cpu().numpy()
 
             # camera frame
             for bidx, res_out_path in enumerate(stages_res_out):
@@ -433,7 +463,8 @@ class MotionOptimizer():
                     'betas' : res_betas[bidx],
                     'trans' : res_trans[bidx],
                     'root_orient' : res_root_orient[bidx],
-                    'pose_body' : res_body_pose[bidx]
+                    'pose_body' : res_body_pose[bidx],
+                    'world_scale': res_world_scale[bidx],
                 }
                 if 'contacts' in rollout_results:
                     save_dict['contacts'] = rollout_results['contacts'][bidx].clone().detach().cpu().numpy()
@@ -451,7 +482,8 @@ class MotionOptimizer():
                         'betas' : res_betas[bidx],
                         'trans' : res_trans[bidx],
                         'root_orient' : res_root_orient[bidx],
-                        'pose_body' : res_body_pose[bidx]
+                        'pose_body' : res_body_pose[bidx],
+                        'world_scale': res_world_scale[bidx],
                     }
                     if 'contacts' in rollout_results:
                         save_dict['contacts'] = rollout_results['contacts'][bidx].clone().detach().cpu().numpy()
@@ -465,9 +497,13 @@ class MotionOptimizer():
 
         motion_optim_curr = motion_optim_refine = None
         if self.stage3_tune_init_state:
-            freeze_optim_params = [self.latent_motion, self.betas]
+#             freeze_optim_params = [self.latent_motion, self.betas]
+            freeze_optim_params = [self.latent_motion, self.betas, self.trans]
             if self.optim_floor:
                 freeze_optim_params += [self.floor_plane]
+
+            if self.optim_scale:
+                freeze_optim_params += [self.world_scale]
             motion_optim_curr = torch.optim.LBFGS(freeze_optim_params,
                                             max_iter=lbfgs_max_iter,
                                             lr=lr,
@@ -489,6 +525,8 @@ class MotionOptimizer():
                 self.trans_vel.requires_grad = False
                 self.joints_vel.requires_grad = False
                 self.root_orient_vel.requires_grad = False
+                if self.optim_scale:
+                    self.world_scale.requires_grad = True
                 if self.stage3_contact_refine_only:
                     self.fitting_loss.loss_weights['contact_height'] = 0.0
                     self.fitting_loss.loss_weights['contact_vel'] = 0.0
@@ -503,6 +541,8 @@ class MotionOptimizer():
                 self.joints_vel.requires_grad = True
                 self.root_orient_vel.requires_grad = True
                 self.betas.requires_grad = True
+                if self.optim_scale:
+                    self.world_scale.requires_grad = True
                 if self.optim_floor:
                     self.floor_plane.requires_grad = True
                 if self.stage3_contact_refine_only:
@@ -528,6 +568,7 @@ class MotionOptimizer():
                 cur_trans = self.trans
                 cur_root_orient = self.root_orient
                 cur_betas = self.betas
+                cur_world_scale = self.world_scale
                 cur_latent_pose = self.latent_pose
                 cur_latent_motion = self.latent_motion
                 cur_cond_prior = None
@@ -572,6 +613,7 @@ class MotionOptimizer():
                 pred_data['trans_vel'] = self.trans_vel
                 pred_data['root_orient_vel'] = self.root_orient_vel
                 pred_data['joints3d_rollout'] = cur_rollout_joints
+                pred_data['world_scale'] = self.world_scale
                 if cur_contacts is not None:
                     pred_data['contacts'] = cur_contacts
                 if cur_contacts_conf is not None:
@@ -583,6 +625,7 @@ class MotionOptimizer():
                     cam_pred_data['latent_pose'] = cur_latent_pose
                     cam_pred_data['betas'] = cur_betas
                     cam_pred_data['floor_plane'] = self.floor_plane
+                    cam_pred_data['world_scale'] = cur_world_scale
 
                 loss_nsteps = self.seq_len
                 loss_obs_data = observed_data
@@ -666,12 +709,15 @@ class MotionOptimizer():
                 res_trans = stage2_prior_data_dict['trans'].clone().detach().cpu().numpy()
                 res_root_orient = stage2_prior_data_dict['root_orient'].clone().detach().cpu().numpy()
                 res_body_pose = cur_body_pose.clone().detach().cpu().numpy()
+                res_world_scale = self.world_scale.clone().detach().cpu().numpy()
                 for bidx, res_out_path in enumerate(stages_res_out):
                     cur_res_out_path = os.path.join(res_out_path, 'stage2_results_prior.npz')
                     np.savez(cur_res_out_path, betas=res_betas[bidx],
                                             trans=res_trans[bidx],
                                             root_orient=res_root_orient[bidx],
-                                            pose_body=res_body_pose[bidx])
+                                            pose_body=res_body_pose[bidx],
+                                            world_scale=res_world_scale[bidx],
+                    )
 
         return final_optim_res, per_stage_outputs
 
@@ -1029,7 +1075,8 @@ class MotionOptimizer():
             'root_orient' : self.root_orient.clone().detach(),
             'pose_body' : body_pose.clone().detach(),
             'betas' : self.betas.clone().detach(),
-            'latent_pose' : self.latent_pose.clone().detach()   
+            'latent_pose' : self.latent_pose.clone().detach(),
+            'world_scale': self.world_scale.clone().detach(),
         }
         optim_result['latent_motion'] = self.latent_motion.clone().detach()
         if self.optim_floor:

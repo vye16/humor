@@ -1,4 +1,5 @@
 import os, time, math
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
 
 import numpy as np
 from .utils import colors

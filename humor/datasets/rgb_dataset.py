@@ -7,20 +7,23 @@ import glob, time, copy, pickle, json, math
 
 from torch.utils.data import Dataset, DataLoader
 
-from fitting.fitting_utils import read_keypoints, load_planercnn_res
+from fitting.fitting_utils import DEFAULT_FOCAL_LEN, read_keypoints, load_planercnn_res
 
 import numpy as np
 import torch
 import cv2
 
 DEFAULT_GROUND = [0.0, -1.0, 0.0, -0.5]
+MAX_SEQ_LEN = 80
 
 class RGBVideoDataset(Dataset):
 
     def __init__(self, joints2d_path,
-                       cam_mat,
+                       camera_path=None,
                        seq_len=None,
                        overlap_len=None,
+                       start_idx=0,
+                       end_idx=-1,
                        img_path=None,
                        load_img=False,
                        masks_path=None,
@@ -32,8 +35,8 @@ class RGBVideoDataset(Dataset):
         Creates a dataset based on a single RGB video.
 
         - joints2d_path : path to saved OpenPose keypoints for the video
-        - cam_mat : 3x3 camera intrinsics
-        - seq_len : If not none, the maximum number of frames in a subsequence, will split the video into subsequences based on this. If none, the dataset contains a single sequence of the whole video.
+        - seq_len : If not none, the maximum number of frames in a subsequence, will split the video into subsequences based on this.
+        If none, the dataset contains a single sequence of the whole video.
         - overlap_len : the minimum number of frames to overlap each subsequence if splitting the video.
         - img_path : path to directory of video frames
         - load_img : if True, will load and return the video frames as part of the data.
@@ -45,9 +48,12 @@ class RGBVideoDataset(Dataset):
         super(RGBVideoDataset, self).__init__()
 
         self.joints2d_path = joints2d_path
-        self.cam_mat = cam_mat
+        self.camera_path = camera_path
+        self.has_cameras = False
         self.seq_len = seq_len
         self.overlap_len = overlap_len
+        self.start_idx = start_idx
+        self.end_idx = end_idx
         self.img_path = img_path
         self.load_img = load_img
         self.masks_path = masks_path
@@ -72,6 +78,10 @@ class RGBVideoDataset(Dataset):
         print('Found video with %d frames...' % (num_frames))
 
         seq_intervals = []
+        start_idx = self.start_idx
+        end_idx = num_frames + 1 + self.end_idx if self.end_idx < 0 else self.end_idx
+        num_frames = end_idx - start_idx
+
         if self.seq_len is not None and self.overlap_len is not None:
             num_seqs = math.ceil((num_frames - self.overlap_len) / (self.seq_len - self.overlap_len))
             r = self.seq_len*num_seqs - self.overlap_len*(num_seqs-1) - num_frames # number of extra frames we cover
@@ -79,10 +89,10 @@ class RGBVideoDataset(Dataset):
             self.overlap_len = self.overlap_len + extra_o
 
             new_cov = self.seq_len*num_seqs - self.overlap_len*(num_seqs-1) # now compute how many frames are still left to account for
-            r = new_cov - num_frames
+            r = new_cov - num_frames 
 
             # create intervals
-            cur_s = 0
+            cur_s = start_idx
             cur_e = cur_s + self.seq_len
             for int_idx in range(num_seqs):
                 seq_intervals.append((cur_s, cur_e))
@@ -96,15 +106,12 @@ class RGBVideoDataset(Dataset):
         else:
             print('Not splitting the video...')
             num_seqs = 1
-            self.seq_len = num_frames
-            seq_intervals = [(0, self.seq_len)]
+            self.seq_len = min(num_frames, MAX_SEQ_LEN)
+            seq_intervals = [(start_idx, end_idx)]
 
         #
         # first load in entire video then split
         #
-
-        # intrinsics
-        cam_mat = self.cam_mat
 
         # path to image frames
         img_paths = None
@@ -128,19 +135,57 @@ class RGBVideoDataset(Dataset):
         else:
             floor_plane = np.array(DEFAULT_GROUND)
 
+        # camera info
+        if self.camera_path is not None:
+            # use the nerf data format for now
+            assert os.path.splitext(self.camera_path)[-1] == ".npz"
+
+            cam_data = np.load(self.camera_path)
+            height, width, focal = cam_data["height"], cam_data["width"], cam_data["focal"]
+            cam_mat = np.array([
+                [focal, 0, width / 2],
+                [0, focal, height / 2],
+                [0, 0, 1]
+            ])
+            print("camera intrinsics", cam_mat)
+
+            w2c = cam_data["w2c"]  # (N, 4, 4)
+
+            assert len(w2c) == len(img_paths)
+            cam_R = w2c[:, :3, :3]  # (N, 3, 3)
+            cam_t = w2c[:, :3, 3]  # (N, 3)
+            self.has_cameras = True
+
+        elif img_paths is not None:
+            img_shape = cv2.imread(img_paths[0]).shape
+            cam_mat = np.array([[DEFAULT_FOCAL_LEN[0], 0.0, img_shape[1] / 2.],
+                                [0.0, DEFAULT_FOCAL_LEN[1], img_shape[0] / 2.],
+                                [0.0, 0.0, 1.0]])
+            print("camera intrinsics", cam_mat)
+
+            cam_R = np.tile(np.eye(3)[None], [len(img_paths), 1, 1])
+            cam_t = np.tile(np.zeros((1, 3)), [len(img_paths), 1])
+            self.has_cameras = True
+
         # get data for each subsequence
         data_out = {
             'img_paths' : [],
             'mask_paths' : [],
             'cam_matx' : [],
+            'cam_R': [],
+            'cam_t': [],
             'joints2d' : [],
             'floor_plane' : [],
             'names' : []
         }
+        # create batches of sequences
         for seq_idx in range(num_seqs):
             sidx, eidx = seq_intervals[seq_idx]
 
-            data_out['cam_matx'].append(cam_mat)
+            if self.has_cameras:
+                data_out['cam_matx'].append(cam_mat)
+                data_out['cam_R'].append(cam_R[sidx:eidx])
+                data_out['cam_t'].append(cam_t[sidx:eidx])
 
             keyp_frames = [read_keypoints(f) for f in keyp_paths[sidx:eidx]]
             joint2d_data = np.stack(keyp_frames, axis=0) # T x J x 3 (x,y,conf)
@@ -152,6 +197,7 @@ class RGBVideoDataset(Dataset):
 
             if img_paths is not None:
                 data_out['img_paths'].append(img_paths[sidx:eidx])
+
             if mask_paths is not None:
                 data_out['mask_paths'].append(mask_paths[sidx:eidx])
 
@@ -220,12 +266,18 @@ class RGBVideoDataset(Dataset):
 
         # floor plane
         obs_data['floor_plane'] = self.data_dict['floor_plane'][idx]
-        # intrinsics
-        gt_data['cam_matx'] = torch.Tensor(self.data_dict['cam_matx'][idx])
+
         # meta-data
         gt_data['name'] = self.data_dict['names'][idx]
 
         # the frames used in this subsequence
         obs_data['seq_interval'] = torch.Tensor(list(self.seq_intervals[idx])).to(torch.int)
+
+        if self.has_cameras:
+            # camera info
+            gt_data['cam_matx'] = torch.Tensor(self.data_dict['cam_matx'][idx])
+
+            obs_data['cam_R'] = torch.Tensor(self.data_dict['cam_R'][idx])
+            obs_data['cam_t'] = torch.Tensor(self.data_dict['cam_t'][idx])
 
         return obs_data, gt_data

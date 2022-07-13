@@ -108,15 +108,13 @@ def main(args):
     for residx, result_dir in enumerate(all_result_dirs):
         seq_name = result_dir.split('/')[-1]
         is_final_res = seq_name == 'final_results'
+        print("is final res", is_final_res)
+        
         if not is_final_res:
             if args.viz_final_only:
                 continue
             seq_name = '_'.join(result_dir.split('/')[-1].split('_')[:-1])
         print('Visualizing %s %d / %d...' % (seq_name, residx, len(all_result_dirs)))
-
-        obs_dict = load_res(result_dir, OBS_NAME + '.npz')
-        cur_img_paths = obs_dict['img_paths'] # used to load in results from baselines
-        cur_frame_names = ['.'.join(f.split('/')[-1].split('.')[:-1]) for f in cur_img_paths]
 
         # load in humor prediction
         pred_res = load_res(result_dir, PRED_RES_NAME + '.npz')
@@ -124,6 +122,11 @@ def main(args):
             print('Could not find final pred (stage 3) results for %s, skipping...' % (seq_name))
             continue
         T = pred_res['trans'].shape[0]
+
+        obs_dict = load_res(result_dir, OBS_NAME + '.npz')
+        cur_img_paths = obs_dict['img_paths'] # used to load in results from baselines
+        cur_frame_names = ['.'.join(f.split('/')[-1].split('.')[:-1]) for f in cur_img_paths]
+
         # check if have any nans valid
         for smpk in SMPL_SIZES.keys():
             cur_valid = (torch.sum(torch.logical_not(torch.isfinite(torch.Tensor(pred_res[smpk])))).item() == 0)
@@ -147,10 +150,11 @@ def main(args):
         # humor prediction in prior frame
         pred_res_prior = None
         if args.viz_prior_frame:
+            print("VISUALIZING PRIOR FRAME")
             pred_res_prior = load_res(result_dir, PRED_PRIOR_RES_NAME + '.npz')
             if pred_res_prior is None:
-                    print('Could not find final prior pred (stage 3) results for %s, skipping...' % (seq_name))
-                    continue
+                print('Could not find final prior pred (stage 3) results for %s, skipping...' % (seq_name))
+                continue
             pred_res_prior = prep_res(pred_res_prior, device, T)
 
         # load stages results if needed 
@@ -196,23 +200,23 @@ def main(args):
             pred_bm = BodyModel(bm_path=optim_bm_path,
                             num_betas=num_pred_betas,
                             batch_size=T).to(device)
-            if not is_final_res:
-                # final results will be different length, so want to re-load for subsequences
-                body_model_dict[optim_bm_path] = pred_bm
-        if not is_final_res:
-            pred_bm = body_model_dict[optim_bm_path]
+            # final results will be different length, so want to re-load for subsequences
+            body_model_dict[optim_bm_path] = pred_bm
+        pred_bm = body_model_dict[optim_bm_path]
 
         # we are using this sequence for sure
         seq_name_list.append(seq_name)
 
         # run through SMPL
-        pred_body = run_smpl(pred_res, pred_bm)
+        with torch.no_grad():
+            pred_body = run_smpl(pred_res, pred_bm)
         
         stages_body = None
         if cur_stages_res is not None:
             stages_body = dict()
             for k, v in cur_stages_res.items():
-                stages_body[k] = run_smpl(v, pred_bm)
+                with torch.no_grad():
+                    stages_body[k] = run_smpl(v, pred_bm)
                 # get body smpl joints
                 stage_body_joints = stages_body[k].Jtr[:, :len(SMPL_JOINTS)]
                 cur_stages_res[k]['joints3d_smpl'] = stage_body_joints
@@ -220,13 +224,15 @@ def main(args):
         # prior frame through SMPL
         pred_prior_body = None
         if pred_res_prior is not None:
-            pred_prior_body = run_smpl(pred_res_prior, pred_bm)
+            with torch.no_grad():
+                pred_prior_body = run_smpl(pred_res_prior, pred_bm)
 
         stages_prior_body = None
         if cur_stages_prior_res is not None:
             stages_prior_body = dict()
             for k, v in cur_stages_prior_res.items():
-                stages_prior_body[k] = run_smpl(v, pred_bm)
+                with torch.no_grad():
+                    stages_prior_body[k] = run_smpl(v, pred_bm)
 
         # load in image frames
         IMW, IMH = None, None
@@ -239,25 +245,44 @@ def main(args):
             img = cv2.resize(img, (D_IMW, D_IMH), interpolation=cv2.INTER_LINEAR)
             img = img.astype(np.float32)[:, :, ::-1] / 255.0
             img_arr[imidx] = img
+        
+        # get the camera poses, if we have them
+        if 'cam_R' in obs_dict and 'cam_t' in obs_dict:
+            print("Loading cameras from observed data")
 
-        # load in camera info
+            cam_R = torch.tensor(obs_dict['cam_R'])
+            cam_t = torch.tensor(obs_dict['cam_t'])
+
+        else:
+            print("Cannot find cameras, using the identity", cur_img_paths[0])
+            cam_R = torch.eye(3)[None].repeat(T, 1, 1)
+            cam_t = torch.zeros((T, 3))
+
+        cam_R, cam_t = cam_R.to(device), cam_t.to(device)
+        viz_cam_t = cam_t
+        if 'world_scale' in pred_res:
+            world_scale = pred_res["world_scale"]
+            print("using predicted world scale", world_scale)
+            viz_cam_t = cam_t * world_scale
+
+        # get camera intrinsics from gt data
         gt_res = None
         gt_res = load_res(result_dir, GT_RES_NAME + '.npz')
         if gt_res is None:
             print('Could not find GT data for %s, skipping...' % (seq_name))
             continue
 
-        # get camera intrinsics
         cam_fx = gt_res['cam_mtx'][0, 0]
         cam_fy = gt_res['cam_mtx'][1, 1]
         cam_cx = gt_res['cam_mtx'][0, 2]
         cam_cy = gt_res['cam_mtx'][1, 2]
         cam_intrins = (cam_fx, cam_fy, cam_cx, cam_cy)
-        # print(cam_intrins)
+        print("camera intrinsics", cam_intrins)
+
         x_frac = float(D_IMW) / IMW
         y_frac = float(D_IMH) / IMH
         cam_intrins_down = (cam_fx*x_frac, cam_fy*y_frac, cam_cx*x_frac, cam_cy*y_frac)
-        
+
         #
         # Qualitative evaluation
         #
@@ -339,7 +364,10 @@ def main(args):
                         camera_intrinsics=cam_intrins_down,
                         img_seq=img_viz,
                         mask_seq=mask_viz,
-                        img_extn=IM_EXTN)
+                        img_extn=IM_EXTN,
+                        cam_R=cam_R,
+                        cam_t=viz_cam_t,
+                        )
         create_video(pred_out_path + '/frame_%08d.' + '%s' % (IM_EXTN), pred_out_path + '.mp4', FPS)
 
         # always comparison of prediction and OG video
@@ -356,6 +384,11 @@ def main(args):
                 if not cur_viz_stages and k != STAGES_RES_NAMES[1]:
                     continue # only want stage 2 in this case
                 stage_out_path = os.path.join(cur_qual_out_path, k)
+                viz_cam_t = cam_t
+                if 'world_scale' in cur_stages_res[k]['world_scale']:
+                    world_scale = cur_stages_res[k]['world_scale']
+                    print("using predicted world scale", world_scale)
+                    viz_cam_t = cam_t * world_scale
                 viz_smpl_seq(stage_body, imw=D_IMW, imh=D_IMH, fps=FPS,
                             render_body=True,
                             render_bodies_static=args.viz_bodies_static,
@@ -377,7 +410,10 @@ def main(args):
                             camera_intrinsics=cam_intrins_down,
                             img_seq=img_viz,
                             mask_seq=mask_viz,
-                            img_extn=IM_EXTN)
+                            img_extn=IM_EXTN,
+                            cam_R=cam_R,
+                            cam_t=viz_cam_t,
+                            )
                 create_video(stage_out_path + '/frame_%08d.' + '%s' % (IM_EXTN), stage_out_path + '.mp4', FPS)
 
             # create comparison
